@@ -1,0 +1,127 @@
+/*
+ * Dự án: Hệ thống Đo địa chấn & Cảnh báo An toàn IoT (ESP32)
+ * Mục đích: Test toàn bộ phần cứng (Cảm biến, Wi-Fi, Firebase, Ngoại vi)
+ */
+
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <ESP32Servo.h>
+
+// --- 1. CẤU HÌNH WI-FI & FIREBASE ---
+#define WIFI_SSID     "Ten_Hotspot_Dien_Thoai"
+#define WIFI_PASSWORD "Mat_Khau_Dien_Thoai"
+
+#define FIREBASE_HOST "url-database-cua-ban.firebaseio.com" // Không có https:// ở đầu
+#define FIREBASE_AUTH "Web_API_Key_Hoac_Database_Secret"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// --- 2. KHAI BÁO CHÂN KẾT NỐI (PINOUT) ---
+const int PIN_GAS   = 34;  // Chân đọc analog cảm biến khí gas (MQ-2 / MQ-135)
+const int PIN_FLAME = 35;  // Chân đọc cảm biến lửa (Digital/Analog)
+const int PIN_RELAY = 19;  // Chân điều khiển Relay (Bơm phun sương / Còi)
+const int PIN_BUZZER= 23;  // Chân còi báo động tại chỗ
+const int PIN_SERVO = 18;  // Chân điều khiển động cơ Servo (Mở cửa)
+
+Servo doorServo;
+Adafruit_MPU6050 mpu;
+
+// Biến lưu thời gian gửi dữ liệu lên Firebase (tránh spam liên tục)
+unsigned long lastSendTime = 0;
+const long interval = 2000; // Gửi mỗi 2 giây
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n--- DANG KHOI DONG HE THONG TEST ESP32 ---");
+
+  // Khởi tạo các chân GPIO
+  pinMode(PIN_RELAY, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_FLAME, INPUT);
+  
+  digitalWrite(PIN_RELAY, LOW);  // Tắt relay ban đầu
+  digitalWrite(PIN_BUZZER, LOW); // Tắt còi ban đầu
+
+  // Khởi tạo Servo
+  doorServo.attach(PIN_SERVO);
+  doorServo.write(0); // Vị trí đóng cửa ban đầu
+
+  // Khởi tạo I2C và MPU6050
+  Wire.begin(21, 22); // SDA = 21, SCL = 22
+  if (!mpu.begin()) {
+    Serial.println("⚠️ Khong tim thay cam bien MPU6050! Kiem tra lai day noi I2C.");
+  } else {
+    Serial.println("✅ Da ket noi MPU6050 thanh cong!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // Kết nối Wi-Fi từ điện thoại
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Dang ket noi Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Wi-Fi Connected! IP: " + WiFi.localIP().toString());
+
+  // Cấu hình Firebase
+  config.host = FIREBASE_HOST;
+  config.api_key = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("✅ Da cau hinh xong Firebase!");
+}
+
+void loop() {
+  // 1. Đọc giá trị từ các cảm biến
+  int gasValue = analogRead(PIN_GAS);
+  int flameState = digitalRead(PIN_FLAME); // Thường LOW khi có lửa, HIGH khi không
+
+  // Đọc gia tốc từ MPU6050 để check rung chấn
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float totalAcc = sqrt(pow(a.acceleration.x, 2) + pow(a.acceleration.y, 2) + pow(a.acceleration.z, 2));
+
+  // Ngưỡng phát hiện rung chấn giả lập (mặc định gia tốc Trái Đất ~9.8 m/s^2, dao động mạnh > 13 m/s^2)
+  bool earthquakeDetected = (totalAcc > 13.0); 
+  bool fireDetected = (flameState == LOW);
+  bool gasDanger = (gasValue > 2000); // Ngưỡng khí gas mẫu
+
+  // 2. Logic xử lý ngoại vi tại chỗ (Xử lý khẩn cấp)
+  if (earthquakeDetected || fireDetected || gasDanger) {
+    digitalWrite(PIN_BUZZER, HIGH); // Bật còi
+    digitalWrite(PIN_RELAY, HIGH);  // Bật bơm phun sương
+    doorServo.write(90);            // Mở thoáng cửa (quay 90 độ)
+    Serial.println("🚨 CANH BAO KHAN CAP: Phat hien su co!");
+  } else {
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(PIN_RELAY, LOW);
+    doorServo.write(0);             // Đóng cửa an toàn
+  }
+
+  // In ra Serial Monitor để kiểm tra nhanh
+  Serial.printf("Gas: %d | Flame: %d | AccTotal: %.2f | Eq: %d\n", gasValue, flameState, totalAcc, earthquakeDetected);
+
+  // 3. Đẩy dữ liệu lên Firebase theo chu kỳ thời gian (tránh nghẽn mạng)
+  if (millis() - lastSendTime > interval) {
+    lastSendTime = millis();
+    if (Firebase.ready()) {
+      Firebase.setInt(fbdo, "/sensors/gas", gasValue);
+      Firebase.setInt(fbdo, "/sensors/flame", fireDetected ? 1 : 0);
+      Firebase.setBool(fbdo, "/sensors/earthquake", earthquakeDetected);
+      Serial.println("☁️ Da cap nhat du lieu len Firebase thanh cong.");
+    } else {
+      Serial.println("⚠️ Mat ket noi Firebase tam thoi...");
+    }
+  }
+
+  delay(500);
+}
